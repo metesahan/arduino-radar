@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Arduino Radar</title>
+<style>
+  :root {
+    --bg: #04110a;
+    --panel: #0a1d12;
+    --line: #1f5c34;
+    --glow: #5cff8a;
+    --dim: #2f8f50;
+    --hit: #ff4a3d;
+    --text: #c9f5d6;
+    --mono: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); font-family: var(--mono);
+    display: flex; flex-direction: column;
+    padding: 12px max(16px, env(safe-area-inset-left, 0px)) 12px max(16px, env(safe-area-inset-right, 0px));
+    gap: 12px;
+  }
+  header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+  h1 { margin: 0; font-size: 18px; letter-spacing: .2em; text-transform: uppercase; color: var(--glow); font-weight: 600; }
+  .status { font-size: 13px; color: var(--dim); }
+  .status b { color: var(--text); font-weight: 600; }
+  .spacer { flex: 1; }
+  button, select {
+    font: inherit; font-size: 14px; color: var(--bg); background: var(--glow);
+    border: 0; border-radius: 4px; padding: 9px 16px; cursor: pointer; font-weight: 700;
+  }
+  button.ghost, select { background: transparent; color: var(--glow); border: 1px solid var(--line); font-weight: 400; }
+  button:focus-visible, select:focus-visible { outline: 2px solid var(--glow); outline-offset: 2px; }
+  button:disabled { opacity: .4; cursor: default; }
+  .screen { flex: 1; min-height: 0; position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .readout { display: flex; flex-wrap: wrap; gap: 8px 28px; font-size: 16px; font-variant-numeric: tabular-nums; }
+  .readout span { color: var(--dim); }
+  .readout b { color: var(--text); font-weight: 600; }
+  .readout .alarm { color: var(--hit); }
+  .msg { font-size: 13px; color: var(--hit); }
+  label { font-size: 13px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Radar</h1>
+  <div class="status" id="status">Durum: <b>Bağlı değil</b></div>
+  <div class="spacer"></div>
+  <label for="range">Menzil
+    <select id="range">
+      <option value="20">20 cm</option>
+      <option value="40" selected>40 cm</option>
+      <option value="100">100 cm</option>
+      <option value="200">200 cm</option>
+    </select>
+  </label>
+  <button class="ghost" id="demo">Deneme modu</button>
+  <button id="connect">Arduino'ya Bağlan</button>
+</header>
+<div class="msg" id="msg" hidden></div>
+<div class="screen"><canvas id="c"></canvas></div>
+<div class="readout">
+  <div><span>Açı </span><b id="ang">–</b></div>
+  <div><span>Mesafe </span><b id="dist">–</b></div>
+  <div><b id="state">Menzil dışı</b></div>
+</div>
+
+<script>
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+
+let maxRange = 40;
+let angle = 90, distance = 0;
+const hits = new Array(181).fill(null);   // {d, t} her açı için son ölçüm
+let demoTimer = null, port = null, reader = null;
+
+$('range').addEventListener('change', e => { maxRange = +e.target.value; });
+
+function showMsg(t) { $('msg').textContent = t; $('msg').hidden = !t; }
+function setStatus(t) { $('status').innerHTML = 'Durum: <b>' + t + '</b>'; }
+
+function onReading(a, d) {
+  if (isNaN(a) || isNaN(d) || a < 0 || a > 180) return;
+  angle = a; distance = d;
+  hits[a] = { d, t: performance.now() };
+  $('ang').textContent = a + '°';
+  const inRange = d > 0 && d <= maxRange;
+  $('dist').textContent = inRange ? d + ' cm' : '–';
+  $('state').textContent = inRange ? 'Cisim algılandı' : 'Menzil dışı';
+  $('state').className = inRange ? 'alarm' : '';
+}
+
+// ---- Arduino bağlantısı (Web Serial) ----
+$('connect').addEventListener('click', async () => {
+  showMsg('');
+  if (!('serial' in navigator)) {
+    showMsg('Bu tarayıcı USB bağlantısını desteklemiyor. Dosyayı Google Chrome veya Microsoft Edge ile aç.');
+    return;
+  }
+  try {
+    stopDemo();
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 9600 });
+    setStatus('Bağlı');
+    $('connect').disabled = true;
+    readLoop();
+  } catch (e) {
+    if (e.name === 'NotFoundError') return; // pencereyi kapattı
+    showMsg('Bağlanılamadı. Arduino IDE açıksa kapatıp tekrar dene. (' + e.message + ')');
+  }
+});
+
+async function readLoop() {
+  const decoder = new TextDecoder();
+  let buf = '';
+  try {
+    reader = port.readable.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('.')) >= 0) {
+        const part = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        const [a, d] = part.split(',');
+        onReading(parseInt(a), parseInt(d));
+      }
+    }
+  } catch (e) {
+    showMsg('Bağlantı koptu. USB kablosunu kontrol edip sayfayı yenile.');
+  } finally {
+    setStatus('Bağlı değil');
+    $('connect').disabled = false;
+    try { reader.releaseLock(); } catch (_) {}
+  }
+}
+
+// ---- Deneme modu (Arduino olmadan) ----
+function stopDemo() {
+  if (demoTimer) { clearInterval(demoTimer); demoTimer = null; $('demo').textContent = 'Deneme modu'; }
+}
+$('demo').addEventListener('click', () => {
+  if (demoTimer) { stopDemo(); setStatus('Bağlı değil'); return; }
+  let a = 15, dir = 1;
+  setStatus('Deneme modu (sahte veri)');
+  $('demo').textContent = 'Denemeyi durdur';
+  demoTimer = setInterval(() => {
+    a += dir;
+    if (a >= 165 || a <= 15) dir *= -1;
+    let d = 0;
+    if (a > 50 && a < 70) d = Math.round(maxRange * 0.55);
+    if (a > 115 && a < 125) d = Math.round(maxRange * 0.3);
+    onReading(a, d);
+  }, 30);
+});
+
+// ---- Çizim ----
+function resize() {
+  const r = cv.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = r.width * dpr; cv.height = r.height * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = { line: css('--line'), glow: css('--glow'), dim: css('--dim'), hit: css('--hit') };
+
+function draw() {
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const R = Math.max(10, Math.min(w / 2 - 40, h - 40));
+  const cx = w / 2, cy = h - 20;
+  const now = performance.now();
+  ctx.clearRect(0, 0, w, h);
+
+  // halkalar ve mesafe etiketleri
+  ctx.lineWidth = 1;
+  ctx.font = '12px ' + css('--mono');
+  ctx.fillStyle = C.dim;
+  ctx.textAlign = 'center';
+  for (let k = 1; k <= 4; k++) {
+    const r = R * k / 4;
+    ctx.strokeStyle = C.line;
+    ctx.beginPath(); ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI); ctx.stroke();
+    ctx.fillText(Math.round(maxRange * k / 4) + ' cm', cx + r - 22, cy - 6);
+  }
+  // açı çizgileri
+  for (let a = 0; a <= 180; a += 30) {
+    const rad = a * Math.PI / 180;
+    ctx.strokeStyle = C.line;
+    ctx.beginPath(); ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + R * Math.cos(rad), cy - R * Math.sin(rad)); ctx.stroke();
+    ctx.fillText(a + '°', cx + (R + 12) * Math.cos(rad), cy - (R + 12) * Math.sin(rad) + 4);
+  }
+
+  // algılanan cisimler (2.5 sn içinde solar)
+  ctx.lineWidth = 6; ctx.lineCap = 'round';
+  for (let a = 0; a <= 180; a++) {
+    const hgt = hits[a];
+    if (!hgt || hgt.d <= 0 || hgt.d > maxRange) continue;
+    const age = (now - hgt.t) / 2500;
+    if (age > 1) continue;
+    const rad = a * Math.PI / 180, r = R * hgt.d / maxRange;
+    ctx.globalAlpha = 1 - age;
+    ctx.strokeStyle = C.hit;
+    ctx.beginPath();
+    ctx.moveTo(cx + r * Math.cos(rad), cy - r * Math.sin(rad));
+    ctx.lineTo(cx + R * Math.cos(rad), cy - R * Math.sin(rad));
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // tarama izi
+  const rad = angle * Math.PI / 180;
+  for (let i = 12; i >= 1; i--) {
+    ctx.globalAlpha = 0.05 * (13 - i) / 12;
+    ctx.fillStyle = C.glow;
+    ctx.beginPath(); ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, R, -rad - i * 0.02, -rad + i * 0.02);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.strokeStyle = C.glow; ctx.lineWidth = 3;
+  ctx.shadowColor = C.glow; ctx.shadowBlur = 12;
+  ctx.beginPath(); ctx.moveTo(cx, cy);
+  ctx.lineTo(cx + R * Math.cos(rad), cy - R * Math.sin(rad)); ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
